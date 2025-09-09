@@ -1,0 +1,236 @@
+sepolia-faucet-dapp/
+├── contracts/
+│   └── SepoliaFaucet.sol
+├── test/
+│   └── SepoliaFaucet.test.js
+├── scripts/
+│   └── deploy.js
+├── frontend/
+│   └── index.html
+├── hardhat.config.js
+├── package.json
+└── README.md
+
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract SepoliaFaucet {
+    address public owner;
+    uint256 public dripAmount;
+    uint256 public cooldown;
+    bool public paused;
+
+    mapping(address => uint256) public nextClaimTime;
+
+    uint256 private _status;
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    event Claimed(address indexed user, uint256 amount, uint256 nextEligibleAt);
+    event DripAmountUpdated(uint256 newAmount);
+    event CooldownUpdated(uint256 newCooldown);
+    event Paused(bool isPaused);
+    event Withdraw(address indexed to, uint256 amount);
+    event Funded(address indexed from, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+    modifier notPaused() {
+        require(!paused, "Faucet paused");
+        _;
+    }
+    modifier nonReentrant() {
+        require(_status != _ENTERED, "Reentrant");
+        _status = _ENTERED;
+        _;
+        _status = _NOT_ENTERED;
+    }
+
+    constructor(uint256 _dripAmount, uint256 _cooldown) {
+        require(_dripAmount > 0, "Drip must be > 0");
+        owner = msg.sender;
+        dripAmount = _dripAmount;
+        cooldown = _cooldown;
+        paused = false;
+        _status = _NOT_ENTERED;
+    }
+
+    receive() external payable {
+        emit Funded(msg.sender, msg.value);
+    }
+
+    function setDripAmount(uint256 _dripAmount) external onlyOwner {
+        dripAmount = _dripAmount;
+        emit DripAmountUpdated(_dripAmount);
+    }
+
+    function setCooldown(uint256 _cooldown) external onlyOwner {
+        cooldown = _cooldown;
+        emit CooldownUpdated(_cooldown);
+    }
+
+    function setPaused(bool _paused) external onlyOwner {
+        paused = _paused;
+        emit Paused(_paused);
+    }
+
+    function withdraw(address payable _to, uint256 _amount) external onlyOwner nonReentrant {
+        require(_amount <= address(this).balance, "Insufficient balance");
+        (bool ok, ) = _to.call{ value: _amount }("");
+        require(ok, "Withdraw failed");
+        emit Withdraw(_to, _amount);
+    }
+
+    function claim() external nonReentrant notPaused {
+        require(address(this).balance >= dripAmount, "Faucet empty");
+        uint256 nowTs = block.timestamp;
+        require(nowTs >= nextClaimTime[msg.sender], "Cooldown active");
+
+        nextClaimTime[msg.sender] = nowTs + cooldown;
+        (bool ok, ) = payable(msg.sender).call{ value: dripAmount }("");
+        require(ok, "Transfer failed");
+
+        emit Claimed(msg.sender, dripAmount, nextClaimTime[msg.sender]);
+    }
+
+    function getStatus(address user) external view returns (
+        uint256 contractBalance,
+        uint256 _dripAmount,
+        uint256 _cooldown,
+        bool _paused,
+        uint256 userNextClaim
+    ) {
+        return (
+            address(this).balance,
+            dripAmount,
+            cooldown,
+            paused,
+            nextClaimTime[user]
+        );
+    }
+}
+
+
+
+const { expect } = require("chai");
+const { ethers } = require("hardhat");
+
+describe("SepoliaFaucet", function () {
+  let Faucet, faucet, owner, user;
+
+  beforeEach(async function () {
+    [owner, user] = await ethers.getSigners();
+    Faucet = await ethers.getContractFactory("SepoliaFaucet");
+    faucet = await Faucet.deploy(ethers.utils.parseEther("0.1"), 86400); // 24h cooldown
+    await faucet.deployed();
+
+    await owner.sendTransaction({ to: faucet.address, value: ethers.utils.parseEther("1.0") });
+  });
+
+  it("allows user to claim and enforces cooldown", async function () {
+    await expect(faucet.connect(user).claim()).to.emit(faucet, "Claimed");
+    await expect(faucet.connect(user).claim()).to.be.revertedWith("Cooldown active");
+  });
+
+  it("owner can withdraw", async function () {
+    const tx = await faucet.withdraw(owner.address, ethers.utils.parseEther("0.5"));
+    await tx.wait();
+    expect(await ethers.provider.getBalance(faucet.address)).to.equal(ethers.utils.parseEther("0.5"));
+  });
+});
+
+
+const { ethers } = require("hardhat");
+
+async function main() {
+  const Faucet = await ethers.getContractFactory("SepoliaFaucet");
+  const faucet = await Faucet.deploy(
+    ethers.utils.parseEther("0.1"), // drip amount
+    86400                           // cooldown = 24h
+  );
+  await faucet.deployed();
+  console.log("Faucet deployed to:", faucet.address);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Sepolia Faucet DApp</title>
+  <script src="https://cdn.jsdelivr.net/npm/ethers/dist/ethers.min.js"></script>
+</head>
+<body>
+  <h1>Sepolia Faucet</h1>
+  <button id="connect">Connect Wallet</button>
+  <button id="claim">Claim 0.1 ETH</button>
+  <p id="status"></p>
+
+  <script>
+    const faucetAddress = "YOUR_DEPLOYED_CONTRACT_ADDRESS";
+    const faucetABI = [
+      "function claim() public",
+      "function getStatus(address user) public view returns (uint256,uint256,uint256,bool,uint256)"
+    ];
+
+    let provider, signer, contract;
+
+    document.getElementById("connect").onclick = async () => {
+      await window.ethereum.request({ method: "eth_requestAccounts" });
+      provider = new ethers.providers.Web3Provider(window.ethereum);
+      signer = provider.getSigner();
+      contract = new ethers.Contract(faucetAddress, faucetABI, signer);
+      document.getElementById("status").innerText = "Wallet connected!";
+    };
+
+    document.getElementById("claim").onclick = async () => {
+      try {
+        const tx = await contract.claim();
+        await tx.wait();
+        document.getElementById("status").innerText = "Claim successful!";
+      } catch (err) {
+        document.getElementById("status").innerText = "Error: " + err.message;
+      }
+    };
+  </script>
+</body>
+</html>
+
+
+require("@nomicfoundation/hardhat-toolbox");
+require("dotenv").config();
+
+module.exports = {
+  solidity: "0.8.20",
+  networks: {
+    sepolia: {
+      url: process.env.SEPOLIA_RPC_URL,
+      accounts: [process.env.PRIVATE_KEY],
+    },
+  },
+};
+
+
+# Sepolia Faucet DApp
+
+A decentralized faucet DApp for Sepolia testnet with:
+- Smart contract (`SepoliaFaucet.sol`)
+- Hardhat tests
+- Deployment script
+- Minimal frontend
+
+## Run locally
+
+```bash
+npm install
+npx hardhat test
+
+
+npx hardhat run scripts/deploy.js --network sepolia
+
